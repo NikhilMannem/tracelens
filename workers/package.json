@@ -1,0 +1,25 @@
+{
+  "name": "tracelens-workers",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/log-worker.ts",
+    "dev:metrics": "tsx watch src/metrics-worker.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/log-worker.js",
+    "start:metrics": "node dist/metrics-worker.js"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.9",
+    "dotenv": "^17.2.0",
+    "pg": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/amqplib": "^0.10.8",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.15.0",
+    "tsx": "^4.20.0",
+    "typescript": "~6.0.0"
+  }
+}
