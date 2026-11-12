@@ -59,16 +59,18 @@ export async function publishMetric(
   const activeChannel = channel;
   if (!activeChannel) throw new Error('Metrics RabbitMQ channel unavailable');
 
-  activeChannel.sendToQueue(
-    QUEUE_NAME,
-    Buffer.from(JSON.stringify(payload)),
-    {
-      persistent: true,
-      contentType: 'application/json',
-    },
-  );
-
-  await activeChannel.waitForConfirms();
+  // Per-message publisher confirm (see publishLog for why not waitForConfirms).
+  await new Promise<void>((resolve, reject) => {
+    activeChannel.sendToQueue(
+      QUEUE_NAME,
+      Buffer.from(JSON.stringify(payload)),
+      {
+        persistent: true,
+        contentType: 'application/json',
+      },
+      (error) => (error ? reject(error) : resolve()),
+    );
+  });
 }
 
 export async function closeMetricsRabbitMQ(): Promise<void> {

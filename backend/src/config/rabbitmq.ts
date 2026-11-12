@@ -84,12 +84,20 @@ export async function publishLog(payload: LogPayload): Promise<void> {
 
   const messageBuffer = Buffer.from(JSON.stringify(payload));
 
-  activeChannel.sendToQueue(QUEUE_NAME, messageBuffer, {
-    persistent: true,
-    contentType: 'application/json',
+  // Wait for the broker to confirm *this* message only. waitForConfirms()
+  // would wait for every outstanding message on the shared channel, so under
+  // concurrent load each request would block on all the others.
+  await new Promise<void>((resolve, reject) => {
+    activeChannel.sendToQueue(
+      QUEUE_NAME,
+      messageBuffer,
+      {
+        persistent: true,
+        contentType: 'application/json',
+      },
+      (error) => (error ? reject(error) : resolve()),
+    );
   });
-
-  await activeChannel.waitForConfirms();
 }
 
 export async function closeRabbitMQ(): Promise<void> {
