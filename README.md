@@ -1,17 +1,19 @@
 # TraceLens — Asynchronous API Monitoring & Incident Detection
 
-TraceLens is a monitoring platform that ingests application logs and metrics asynchronously, detects repeated error bursts, and tracks incidents through a web dashboard.
+[![CI](https://github.com/NikhilMannem/tracelens/actions/workflows/ci.yml/badge.svg)](https://github.com/NikhilMannem/tracelens/actions/workflows/ci.yml)
+
+TraceLens is a monitoring platform that ingests application logs and metrics asynchronously, detects error bursts and metric anomalies with configurable rules, and tracks incidents through a web dashboard.
 
 ## Features
 
 - REST API for application logs, metrics, services, and incidents
-- RabbitMQ-based asynchronous message processing
-- Node.js/TypeScript workers for log and metric persistence
-- PostgreSQL storage for logs, metrics, services, and incidents
-- Automatic detection of repeated error bursts
-- Incident severity and lifecycle management
+- RabbitMQ-based asynchronous processing with publisher confirms and manual acks
+- Bounded retries with delay and a dead-letter queue for failed messages
+- PostgreSQL storage with schema migrations applied automatically on first start
+- Configurable incident rules (`ERROR_COUNT`, `METRIC_AVG`) stored in the database
+- Incident deduplication through a partial unique index
 - React dashboard with incident filtering and status actions
-- Docker Compose deployment
+- Docker Compose deployment and GitHub Actions CI
 
 ## Technology Stack
 
@@ -24,12 +26,51 @@ TraceLens is a monitoring platform that ingests application logs and metrics asy
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    C[Client services / simulator] -->|POST /api/logs, /api/metrics| API[Express API]
+    API -->|publish + confirm| Q[(RabbitMQ<br/>tracelens.logs<br/>tracelens.metrics)]
+    Q --> W[Log & metrics workers]
+    W -->|insert| DB[(PostgreSQL)]
+    W -.->|temporary failure| R[(*.retry<br/>5 s TTL)]
+    R -.->|redeliver| Q
+    W -.->|permanent failure or<br/>3 attempts| DLQ[(*.dlq)]
+    D[Incident detector<br/>every 15 s] -->|evaluate rules| DB
+    D -->|upsert incident| DB
+    UI[React dashboard] --> API
+```
+
 1. Applications submit logs and metrics through the API.
-2. The backend validates incoming data and publishes messages to RabbitMQ.
-3. Workers consume messages and persist the data to PostgreSQL.
-4. The incident detector evaluates error activity and creates incidents when configured thresholds are reached.
-5. The dashboard retrieves incident and metric data through the API.
-6. Operators investigate and resolve incidents through the dashboard.
+2. The backend validates the payload, publishes it to RabbitMQ, and returns `202 Accepted` only after the broker confirms the message.
+3. Workers consume messages and persist them to PostgreSQL, acknowledging each message only after a successful write.
+4. The incident detector evaluates the enabled rules in `incident_rules` and opens or escalates incidents when thresholds are reached.
+5. Operators investigate and resolve incidents through the dashboard.
+
+## Reliability
+
+| Failure | Handling |
+|---|---|
+| Database temporarily unavailable | Message moves to a `*.retry` queue and is redelivered after 5 s, up to 3 attempts |
+| Still failing after 3 attempts | Message is parked in `*.dlq` with the error and failure time in its headers |
+| Malformed payload or unknown service | Sent straight to `*.dlq` (retrying would never succeed) |
+| Worker crashes mid-processing | Unacked message is redelivered by RabbitMQ |
+| Repeated detections for the same problem | A partial unique index on `(service_id, title)` for active incidents keeps one open incident, escalating severity instead of duplicating |
+
+A message is acknowledged only after the broker has confirmed its copy in the retry or dead-letter queue, so a crash produces at worst a duplicate and never a lost message. Without this, a single failing message was requeued immediately and retried forever.
+
+## Performance
+
+Detector query (`COUNT` of ERROR logs for one service in a time window), measured with `EXPLAIN ANALYZE` on 1,000,000 log rows, median of 7 runs:
+
+| Window | No index | `(service_id, occurred_at)` index | + partial index `WHERE level = 'ERROR'` |
+|---|---|---|---|
+| 1 minute | 339 ms | 0.13 ms | 0.21 ms |
+| 60 minutes | 436 ms | 5.0 ms | 2.1 ms |
+| 24 hours | 237 ms | 110 ms | 64 ms |
+
+The partial index is 3 MB compared with 30 MB for a full index on the same columns, because only ERROR rows are indexed.
+
+Load test with 50 concurrent clients for 30 s (`autocannon`, run inside the Docker network): every accepted log (2,165 of 2,165) was persisted, and the queue drained within about 2 s of the test ending. Absolute throughput was limited by the Docker Desktop VM on the test laptop, so it is not reported here.
 
 ## Prerequisites
 
@@ -39,9 +80,13 @@ TraceLens is a monitoring platform that ingests application logs and metrics asy
 
 ## Run with Docker
 
-Clone the repository, enter the project directory, and configure the root `.env` file with the required PostgreSQL credentials and application settings.
+Clone the repository, enter the project directory, and create your `.env` from the example:
 
-Build and start the stack:
+```powershell
+copy .env.example .env
+```
+
+Build and start the stack. On the first start, Postgres applies every file in `backend/sql` in order, creating the schema, demo services, and default incident rules:
 
 ```powershell
 docker compose up -d --build
@@ -66,6 +111,21 @@ docker compose down
 ```
 
 This preserves named database volumes. To remove persisted data as well, Docker volumes must be explicitly removed; do so only when you intend to erase stored data.
+
+Generate traffic, or trigger an incident on demand:
+
+```powershell
+cd simulator
+npm install
+npx tsx src/index.ts            # steady traffic
+npx tsx src/index.ts --burst    # 12 ERROR logs, opens a CRITICAL incident
+```
+
+The SQL files only run against an empty database. For an existing database, apply new files manually, for example:
+
+```powershell
+Get-Content backend/sql/004_error_logs_partial_index.sql | docker exec -i tracelens-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+```
 
 ## Local Development
 
@@ -108,7 +168,7 @@ Local development requires PostgreSQL, RabbitMQ, and the root environment variab
 | Dashboard (Docker) | http://localhost:8081 |
 | Backend health | http://localhost:3000/health |
 | Incident API | http://localhost:3000/api/incidents?limit=100 |
-| RabbitMQ management | http://localhost:15672 |
+| RabbitMQ management (queues, DLQ) | http://localhost:15672 |
 | PostgreSQL host port | `5433` |
 
 Port mappings can vary depending on the local environment and Compose configuration.
@@ -171,8 +231,6 @@ The detector's configured threshold and evaluation window determine when an inci
 - Change development-only credentials before any shared or production deployment.
 - Configure allowed CORS origins for the intended deployment environment.
 - Add authentication and authorization before exposing management or incident APIs publicly.
-- Use bounded retry policies and dead-letter handling for production message processing.
-
 ## Project Status
 
-The core API, asynchronous processing pipeline, incident lifecycle, dashboard, and Docker deployment have been implemented and verified in the development environment. Further production hardening and integration testing remain areas for improvement.
+The core API, asynchronous processing pipeline with retries and dead-lettering, configurable incident rules, dashboard, Docker deployment, and CI are implemented and verified. Authentication and a dead-letter replay endpoint are the next areas for improvement.
