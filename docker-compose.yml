@@ -28,6 +28,9 @@ services:
       - "${DB_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Schema and seed data, applied in filename order on first start
+      # (only when the postgres_data volume is empty).
+      - ./backend/sql:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 5s
