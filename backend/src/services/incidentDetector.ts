@@ -3,29 +3,47 @@ import { pool } from '../config/db';
 
 type Severity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
 
+type Comparison = 'GT' | 'GTE';
+
 type ServiceRow = {
   id: string;
   name: string;
 };
 
-type CountRow = {
-  count: string;
+type RuleRow = {
+  rule_key: string;
+  rule_type: 'ERROR_COUNT' | 'METRIC_AVG';
+  title: string;
+  metric_name: string | null;
+  threshold: string;
+  comparison: Comparison;
+  window_minutes: number;
+  severity: Severity;
 };
 
-type AverageRow = {
-  average: string | null;
+type ObservedValue = {
+  value: string | null;
 };
 
-const ERROR_WINDOW_MINUTES = 1;
-const ERROR_HIGH_THRESHOLD = 5;
-const ERROR_CRITICAL_THRESHOLD = 10;
+const severityRank: Record<Severity, number> = {
+  LOW: 1,
+  MEDIUM: 2,
+  HIGH: 3,
+  CRITICAL: 4,
+};
 
-const RESPONSE_WINDOW_MINUTES = 5;
-const RESPONSE_TIME_THRESHOLD_MS = 1000;
+// Exported so that we can unit-test threshold behaviour.
+export function thresholdMet(
+  observed: number,
+  threshold: number,
+  comparison: Comparison,
+): boolean {
+  if (comparison === 'GTE') {
+    return observed >= threshold;
+  }
 
-// Define request_rate as requests per minute for the simulator.
-const TRAFFIC_WINDOW_MINUTES = 1;
-const TRAFFIC_THRESHOLD_PER_MINUTE = 100;
+  return observed > threshold;
+}
 
 async function createOrUpdateIncident(
   serviceId: string,
@@ -33,7 +51,7 @@ async function createOrUpdateIncident(
   description: string,
   severity: Severity,
 ): Promise<void> {
-  const result = await pool.query(
+  await pool.query(
     `INSERT INTO incidents
        (service_id, title, description, severity, status)
      VALUES ($1, $2, $3, $4, 'OPEN')
@@ -42,136 +60,151 @@ async function createOrUpdateIncident(
      DO UPDATE SET
        description = EXCLUDED.description,
        severity = CASE
-         WHEN CASE incidents.severity
-           WHEN 'LOW' THEN 1
-           WHEN 'MEDIUM' THEN 2
-           WHEN 'HIGH' THEN 3
-           WHEN 'CRITICAL' THEN 4
-         END
-         <
-         CASE EXCLUDED.severity
-           WHEN 'LOW' THEN 1
-           WHEN 'MEDIUM' THEN 2
-           WHEN 'HIGH' THEN 3
-           WHEN 'CRITICAL' THEN 4
-         END
+         WHEN
+           CASE incidents.severity
+             WHEN 'LOW' THEN 1
+             WHEN 'MEDIUM' THEN 2
+             WHEN 'HIGH' THEN 3
+             WHEN 'CRITICAL' THEN 4
+           END
+           <
+           CASE EXCLUDED.severity
+             WHEN 'LOW' THEN 1
+             WHEN 'MEDIUM' THEN 2
+             WHEN 'HIGH' THEN 3
+             WHEN 'CRITICAL' THEN 4
+           END
          THEN EXCLUDED.severity
          ELSE incidents.severity
-       END
-     RETURNING id`,
+       END`,
     [serviceId, title, description, severity],
   );
-
-  if (result.rowCount && result.rowCount > 0) {
-    // The upsert also returns an ID when it updates an existing incident.
-    // A separate insert-only result is added below for clean reporting.
-  }
 }
 
-async function detectErrorBursts(service: ServiceRow): Promise<void> {
-  const result = await pool.query<CountRow>(
-    `SELECT COUNT(*)::text AS count
-     FROM logs
-     WHERE service_id = $1
-       AND level = 'ERROR'
-       AND occurred_at >= NOW() - ($2 * INTERVAL '1 minute')`,
-    [service.id, ERROR_WINDOW_MINUTES],
-  );
+async function evaluateRule(
+  service: ServiceRow,
+  rule: RuleRow,
+): Promise<void> {
+  let observed: number | null = null;
 
-  const count = Number(result.rows[0]?.count ?? 0);
+  if (rule.rule_type === 'ERROR_COUNT') {
+    const result = await pool.query<ObservedValue>(
+      `SELECT COUNT(*)::text AS value
+       FROM logs
+       WHERE service_id = $1
+         AND level = 'ERROR'
+         AND occurred_at >=
+             NOW() - ($2 * INTERVAL '1 minute')`,
+      [service.id, rule.window_minutes],
+    );
 
-  if (count >= ERROR_CRITICAL_THRESHOLD) {
-    await createOrUpdateIncident(
-      service.id,
-      'Repeated error burst',
-      `${count} ERROR logs detected within the last minute.`,
-      'CRITICAL',
-    );
-  } else if (count >= ERROR_HIGH_THRESHOLD) {
-    await createOrUpdateIncident(
-      service.id,
-      'Repeated error burst',
-      `${count} ERROR logs detected within the last minute.`,
-      'HIGH',
-    );
+    const value = result.rows[0]?.value;
+
+    observed = value === null || value === undefined
+      ? null
+      : Number(value);
   }
-}
 
-async function detectSlowResponses(service: ServiceRow): Promise<void> {
-  const result = await pool.query<AverageRow>(
-    `SELECT AVG(value)::text AS average
-     FROM metrics
-     WHERE service_id = $1
-       AND metric_name = 'response_time_ms'
-       AND recorded_at >= NOW() - ($2 * INTERVAL '1 minute')`,
-    [service.id, RESPONSE_WINDOW_MINUTES],
-  );
-
-  const average = result.rows[0]?.average;
-
-  if (average !== null && average !== undefined) {
-    const responseTime = Number(average);
-
-    if (Number.isFinite(responseTime) &&
-        responseTime > RESPONSE_TIME_THRESHOLD_MS) {
-      await createOrUpdateIncident(
-        service.id,
-        'High response time',
-        `Average response time is ${Math.round(responseTime)} ms over the last five minutes.`,
-        'HIGH',
+  if (rule.rule_type === 'METRIC_AVG') {
+    if (!rule.metric_name) {
+      throw new Error(
+        `Missing metric name for rule ${rule.rule_key}`,
       );
     }
-  }
-}
 
-async function detectTrafficSpikes(service: ServiceRow): Promise<void> {
-  const result = await pool.query<AverageRow>(
-    `SELECT AVG(value)::text AS average
-     FROM metrics
-     WHERE service_id = $1
-       AND metric_name = 'requests_per_minute'
-       AND recorded_at >= NOW() - ($2 * INTERVAL '1 minute')`,
-    [service.id, TRAFFIC_WINDOW_MINUTES],
+    const result = await pool.query<ObservedValue>(
+      `SELECT AVG(value)::text AS value
+       FROM metrics
+       WHERE service_id = $1
+         AND metric_name = $2
+         AND recorded_at >=
+             NOW() - ($3 * INTERVAL '1 minute')`,
+      [
+        service.id,
+        rule.metric_name,
+        rule.window_minutes,
+      ],
+    );
+
+    const value = result.rows[0]?.value;
+
+    observed = value === null || value === undefined
+      ? null
+      : Number(value);
+  }
+
+  if (observed === null || !Number.isFinite(observed)) {
+    return;
+  }
+
+  const threshold = Number(rule.threshold);
+
+  if (!thresholdMet(observed, threshold, rule.comparison)) {
+    return;
+  }
+
+  const description =
+    rule.rule_type === 'ERROR_COUNT'
+      ? `${observed} ERROR logs detected within the last ${rule.window_minutes} minute(s).`
+      : `Average ${rule.metric_name} is ${observed.toFixed(2)} over the last ${rule.window_minutes} minute(s).`;
+
+  console.log(
+    `Rule ${rule.rule_key} triggered for ${service.name}`,
   );
 
-  const average = result.rows[0]?.average;
-
-  if (average !== null && average !== undefined) {
-    const requestsPerMinute = Number(average);
-
-    if (Number.isFinite(requestsPerMinute) &&
-        requestsPerMinute > TRAFFIC_THRESHOLD_PER_MINUTE) {
-      await createOrUpdateIncident(
-        service.id,
-        'Traffic spike detected',
-        `Average traffic is ${Math.round(requestsPerMinute)} requests per minute.`,
-        'MEDIUM',
-      );
-    }
-  }
+  await createOrUpdateIncident(
+    service.id,
+    rule.title,
+    description,
+    rule.severity,
+  );
 }
 
 export async function detectIncidentsOnce(): Promise<void> {
-  const services = await pool.query<ServiceRow>(
-    'SELECT id, name FROM services ORDER BY id',
-  );
+  const [servicesResult, rulesResult] = await Promise.all([
+    pool.query<ServiceRow>(
+      'SELECT id, name FROM services ORDER BY id',
+    ),
 
-  for (const service of services.rows) {
-    try {
-      await detectErrorBursts(service);
-      await detectSlowResponses(service);
-      await detectTrafficSpikes(service);
-    } catch (error) {
-      // One service/rule failing should not stop detection for other services.
-      console.error(
-        `Incident detection failed for ${service.name}:`,
-        error,
-      );
+    pool.query<RuleRow>(
+      `SELECT
+         rule_key,
+         rule_type,
+         title,
+         metric_name,
+         threshold::text AS threshold,
+         comparison,
+         window_minutes,
+         severity
+       FROM incident_rules
+       WHERE enabled = TRUE
+       ORDER BY
+         CASE severity
+           WHEN 'CRITICAL' THEN 4
+           WHEN 'HIGH' THEN 3
+           WHEN 'MEDIUM' THEN 2
+           WHEN 'LOW' THEN 1
+         END DESC`,
+    ),
+  ]);
+
+  for (const service of servicesResult.rows) {
+    for (const rule of rulesResult.rows) {
+      try {
+        await evaluateRule(service, rule);
+      } catch (error) {
+        console.error(
+          `Rule ${rule.rule_key} failed for ${service.name}:`,
+          error,
+        );
+      }
     }
   }
 }
 
-export function startIncidentDetector(intervalMs = 15_000): () => void {
+export function startIncidentDetector(
+  intervalMs = 15_000,
+): () => void {
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
