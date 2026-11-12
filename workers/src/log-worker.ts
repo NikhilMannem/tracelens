@@ -1,8 +1,16 @@
 
 import dotenv from 'dotenv';
 import path from 'node:path';
-import amqp, { type Channel, type ChannelModel, type ConsumeMessage } from 'amqplib';
+import amqp, { type ChannelModel, type ConfirmChannel, type ConsumeMessage } from 'amqplib';
 import { Pool } from 'pg';
+import {
+  MAX_ATTEMPTS,
+  assertTopology,
+  attemptOf,
+  deadLetter,
+  retryOrDeadLetter,
+  topologyFor,
+} from './retry';
 
 dotenv.config({
   path: path.resolve(__dirname, '../../.env'),
@@ -10,6 +18,7 @@ dotenv.config({
 });
 
 const QUEUE_NAME = 'tracelens.logs';
+const topology = topologyFor(QUEUE_NAME);
 
 const rabbitmqUrl = process.env.RABBITMQ_URL;
 
@@ -57,7 +66,7 @@ type LogPayload = {
 };
 
 let connection: ChannelModel | undefined;
-let channel: Channel | undefined;
+let channel: ConfirmChannel | undefined;
 let stopping = false;
 
 function parseLog(content: Buffer): LogPayload | null {
@@ -100,7 +109,7 @@ async function processLog(payload: LogPayload): Promise<boolean> {
   );
 
   if (serviceResult.rows.length === 0) {
-    console.error(`Unknown service "${payload.serviceName}". Discarding message.`);
+    console.error(`Unknown service "${payload.serviceName}".`);
     return false;
   }
 
@@ -119,42 +128,61 @@ async function processLog(payload: LogPayload): Promise<boolean> {
 }
 
 async function handleMessage(
-  activeChannel: Channel,
+  activeChannel: ConfirmChannel,
   message: ConsumeMessage,
 ): Promise<void> {
-  const payload = parseLog(message.content);
-
-  if (!payload) {
-    console.error('Invalid log message. Discarding message.');
-    activeChannel.ack(message);
-    return;
-  }
-
   try {
-    const stored = await processLog(payload);
+    const payload = parseLog(message.content);
 
-    // Ack only after successful persistence or permanent validation failure.
+    // Permanent failures go straight to the dead-letter queue: retrying
+    // a malformed message or an unknown service would never succeed.
+    if (!payload) {
+      console.error('Invalid log message. Moving to dead-letter queue.');
+      await deadLetter(activeChannel, topology, message, 'Invalid log payload');
+      return;
+    }
+
+    let stored: boolean;
+
+    try {
+      stored = await processLog(payload);
+    } catch (error) {
+      // Database errors are treated as temporary: retry with a delay,
+      // then dead-letter after MAX_ATTEMPTS.
+      const attempt = attemptOf(message);
+      const outcome = await retryOrDeadLetter(activeChannel, topology, message, error);
+
+      console.error(
+        `Failed to persist log (attempt ${attempt}/${MAX_ATTEMPTS}); ${outcome}:`,
+        error,
+      );
+      return;
+    }
+
+    if (!stored) {
+      await deadLetter(
+        activeChannel,
+        topology,
+        message,
+        `Unknown service "${payload.serviceName}"`,
+      );
+      return;
+    }
+
     activeChannel.ack(message);
-
-    if (stored) {
-      console.log(`Stored ${payload.level} log for ${payload.serviceName}`);
-    }
+    console.log(`Stored ${payload.level} log for ${payload.serviceName}`);
   } catch (error) {
-    console.error('Failed to persist log; requeueing message:', error);
-
-    // Database errors are treated as potentially temporary.
-    // Production hardening should add bounded retries and a dead-letter queue.
-    if (!stopping) {
-      activeChannel.nack(message, false, true);
-    }
+    // Publishing to the retry/dead-letter queue failed (for example the
+    // channel closed). The message stays unacked and RabbitMQ redelivers it.
+    console.error('Could not route failed log message:', error);
   }
 }
 
 async function startWorker(): Promise<void> {
   connection = await amqp.connect(rabbitmqUrl!);
-  channel = await connection.createChannel();
+  channel = await connection.createConfirmChannel();
 
-  await channel.assertQueue(QUEUE_NAME, { durable: true });
+  await assertTopology(channel, topology);
 
   // Prevent this worker from taking more than ten unacknowledged messages.
   await channel.prefetch(10);
@@ -162,7 +190,7 @@ async function startWorker(): Promise<void> {
   await channel.consume(
     QUEUE_NAME,
     (message: ConsumeMessage | null) => {
-      if (message && channel) {
+      if (message && channel && !stopping) {
         void handleMessage(channel, message);
       }
     },

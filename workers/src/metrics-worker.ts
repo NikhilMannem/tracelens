@@ -2,11 +2,19 @@
 import dotenv from 'dotenv';
 import path from 'node:path';
 import amqp, {
-  type Channel,
   type ChannelModel,
+  type ConfirmChannel,
   type ConsumeMessage,
 } from 'amqplib';
 import { Pool } from 'pg';
+import {
+  MAX_ATTEMPTS,
+  assertTopology,
+  attemptOf,
+  deadLetter,
+  retryOrDeadLetter,
+  topologyFor,
+} from './retry';
 
 dotenv.config({
   path: path.resolve(__dirname, '../../.env'),
@@ -14,6 +22,7 @@ dotenv.config({
 });
 
 const queueName = 'tracelens.metrics';
+const topology = topologyFor(queueName);
 const rabbitmqUrl = process.env.RABBITMQ_URL;
 
 if (!rabbitmqUrl) {
@@ -90,7 +99,7 @@ async function persistMetric(metric: MetricPayload): Promise<boolean> {
   );
 
   if (service.rows.length === 0) {
-    console.error(`Unknown service "${metric.serviceName}". Discarding metric.`);
+    console.error(`Unknown service "${metric.serviceName}".`);
     return false;
   }
 
@@ -109,41 +118,63 @@ async function persistMetric(metric: MetricPayload): Promise<boolean> {
 }
 
 async function handleMetric(
-  channel: Channel,
+  channel: ConfirmChannel,
   message: ConsumeMessage,
 ): Promise<void> {
-  const metric = parseMetric(message.content);
-
-  if (!metric) {
-    console.error('Invalid metric message. Discarding.');
-    channel.ack(message);
-    return;
-  }
-
   try {
-    const stored = await persistMetric(metric);
-    channel.ack(message);
+    const metric = parseMetric(message.content);
 
-    if (stored) {
-      console.log(
-        `Stored ${metric.metricName}=${metric.value} for ${metric.serviceName}`,
-      );
+    if (!metric) {
+      console.error('Invalid metric message. Moving to dead-letter queue.');
+      await deadLetter(channel, topology, message, 'Invalid metric payload');
+      return;
     }
+
+    let stored: boolean;
+
+    try {
+      stored = await persistMetric(metric);
+    } catch (error) {
+      const attempt = attemptOf(message);
+      const outcome = await retryOrDeadLetter(channel, topology, message, error);
+
+      console.error(
+        `Metric persistence failed (attempt ${attempt}/${MAX_ATTEMPTS}); ${outcome}:`,
+        error,
+      );
+      return;
+    }
+
+    if (!stored) {
+      await deadLetter(
+        channel,
+        topology,
+        message,
+        `Unknown service "${metric.serviceName}"`,
+      );
+      return;
+    }
+
+    channel.ack(message);
+    console.log(
+      `Stored ${metric.metricName}=${metric.value} for ${metric.serviceName}`,
+    );
   } catch (error) {
-    console.error('Metric persistence failed; requeueing:', error);
-    channel.nack(message, false, true);
+    // Routing to retry/dead-letter failed; the message stays unacked
+    // and RabbitMQ redelivers it.
+    console.error('Could not route failed metric message:', error);
   }
 }
 
 let connection: ChannelModel | undefined;
-let channel: Channel | undefined;
+let channel: ConfirmChannel | undefined;
 let stopping = false;
 
 async function start(): Promise<void> {
   connection = await amqp.connect(rabbitmqUrl!);
-  channel = await connection.createChannel();
+  channel = await connection.createConfirmChannel();
 
-  await channel.assertQueue(queueName, { durable: true });
+  await assertTopology(channel, topology);
   await channel.prefetch(10);
 
   await channel.consume(
